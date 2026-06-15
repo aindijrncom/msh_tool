@@ -1,0 +1,12 @@
+build/
+*.exe
+*.vtk
+*.vtu
+*.msh
+*.cas
+*.dat
+test_*.msh
+.vscode/
+.idea/
+*.user
+CMakeUserPresets.json
