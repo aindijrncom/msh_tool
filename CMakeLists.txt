@@ -5,6 +5,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Static linking for MinGW (self-contained .exe, no DLL dependency)
+if(MINGW)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static-libgcc -static-libstdc++ -static")
+endif()
+
 # nlohmann/json (header-only)
 add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json INTERFACE include)

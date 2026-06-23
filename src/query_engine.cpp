@@ -1,9 +1,238 @@
 #include "query_engine.h"
+#include <algorithm>
 #include <map>
 #include <set>
 #include <cmath>
+#include <limits>
+#include <vector>
 
 namespace msh {
+
+namespace {
+
+struct Vec3 {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+};
+
+Vec3 subtract(const Vec3& a, const Vec3& b) {
+    return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+double dot(const Vec3& a, const Vec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+Vec3 cross(const Vec3& a, const Vec3& b) {
+    return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    };
+}
+
+double norm(const Vec3& v) {
+    return std::sqrt(dot(v, v));
+}
+
+bool node_position(const MeshData& data, int node_id, Vec3& p) {
+    int idx = node_id - 1;
+    if (idx < 0 || static_cast<size_t>(idx) >= data.node_count()) return false;
+    p = {data.nodes_x[idx], data.nodes_y[idx], data.nodes_z[idx]};
+    return true;
+}
+
+bool face_centroid(const MeshData& data, int face_idx, Vec3& centroid) {
+    size_t total_faces = data.face_count();
+    if (face_idx < 0 || static_cast<size_t>(face_idx) >= total_faces) return false;
+
+    size_t off = data.face_node_offset[face_idx];
+    size_t next = (static_cast<size_t>(face_idx + 1) < total_faces)
+                      ? data.face_node_offset[face_idx + 1]
+                      : data.face_nodes.size();
+    int count = 0;
+    centroid = {};
+    for (size_t j = off; j < next; j++) {
+        Vec3 p;
+        if (!node_position(data, data.face_nodes[j], p)) continue;
+        centroid.x += p.x;
+        centroid.y += p.y;
+        centroid.z += p.z;
+        count++;
+    }
+
+    if (count == 0) return false;
+    centroid.x /= static_cast<double>(count);
+    centroid.y /= static_cast<double>(count);
+    centroid.z /= static_cast<double>(count);
+    return true;
+}
+
+bool face_normal(const MeshData& data, int face_idx, Vec3& normal) {
+    size_t total_faces = data.face_count();
+    if (face_idx < 0 || static_cast<size_t>(face_idx) >= total_faces) return false;
+
+    size_t off = data.face_node_offset[face_idx];
+    size_t next = (static_cast<size_t>(face_idx + 1) < total_faces)
+                      ? data.face_node_offset[face_idx + 1]
+                      : data.face_nodes.size();
+    size_t ncount = next - off;
+    if (ncount < 3) return false;
+
+    Vec3 p0, p1, p2;
+    if (!node_position(data, data.face_nodes[off], p0) ||
+        !node_position(data, data.face_nodes[off + 1], p1) ||
+        !node_position(data, data.face_nodes[off + 2], p2)) {
+        return false;
+    }
+
+    normal = cross(subtract(p1, p0), subtract(p2, p0));
+
+    // Accumulate fan triangles for polygonal faces, matching Validator behavior.
+    for (size_t i = 3; i < ncount; i++) {
+        Vec3 prev, cur;
+        if (!node_position(data, data.face_nodes[off + i - 1], prev) ||
+            !node_position(data, data.face_nodes[off + i], cur)) {
+            continue;
+        }
+        Vec3 n = cross(subtract(prev, p0), subtract(cur, p0));
+        normal.x += n.x;
+        normal.y += n.y;
+        normal.z += n.z;
+    }
+
+    return norm(normal) > 0.0;
+}
+
+nlohmann::json build_centroid_check_stats(const MeshData& data) {
+    nlohmann::json j;
+
+    int total_cells = static_cast<int>(data.cell_count());
+    int total_faces = static_cast<int>(data.face_count());
+
+    std::vector<std::vector<int>> cell_faces(total_cells + 1);
+    std::vector<Vec3> cell_centroids(total_cells + 1);
+    std::vector<int> cell_face_counts(total_cells + 1, 0);
+
+    Vec3 bmin{std::numeric_limits<double>::max(), std::numeric_limits<double>::max(), std::numeric_limits<double>::max()};
+    Vec3 bmax{std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest(), std::numeric_limits<double>::lowest()};
+    for (size_t i = 0; i < data.node_count(); i++) {
+        bmin.x = std::min(bmin.x, data.nodes_x[i]);
+        bmin.y = std::min(bmin.y, data.nodes_y[i]);
+        bmin.z = std::min(bmin.z, data.nodes_z[i]);
+        bmax.x = std::max(bmax.x, data.nodes_x[i]);
+        bmax.y = std::max(bmax.y, data.nodes_y[i]);
+        bmax.z = std::max(bmax.z, data.nodes_z[i]);
+    }
+    double mesh_scale = data.node_count() > 0 ? norm(subtract(bmax, bmin)) : 1.0;
+    if (mesh_scale <= 0.0) mesh_scale = 1.0;
+    double tolerance = mesh_scale * 1e-10;
+
+    for (int f = 0; f < total_faces; f++) {
+        Vec3 fc;
+        bool has_centroid = face_centroid(data, f, fc);
+
+        int c0 = data.face_c0[f];
+        if (c0 > 0 && c0 <= total_cells) {
+            cell_faces[c0].push_back(f);
+            if (has_centroid) {
+                cell_centroids[c0].x += fc.x;
+                cell_centroids[c0].y += fc.y;
+                cell_centroids[c0].z += fc.z;
+                cell_face_counts[c0]++;
+            }
+        }
+
+        int c1 = data.face_c1[f];
+        if (c1 > 0 && c1 <= total_cells) {
+            cell_faces[c1].push_back(f);
+            if (has_centroid) {
+                cell_centroids[c1].x += fc.x;
+                cell_centroids[c1].y += fc.y;
+                cell_centroids[c1].z += fc.z;
+                cell_face_counts[c1]++;
+            }
+        }
+    }
+
+    int checked = 0;
+    int inside = 0;
+    int outside = 0;
+    int skipped = 0;
+    double max_violation = 0.0;
+    nlohmann::json failed_cells = nlohmann::json::array();
+
+    for (int c = 1; c <= total_cells; c++) {
+        if (cell_faces[c].empty() || cell_face_counts[c] == 0) {
+            skipped++;
+            continue;
+        }
+
+        cell_centroids[c].x /= static_cast<double>(cell_face_counts[c]);
+        cell_centroids[c].y /= static_cast<double>(cell_face_counts[c]);
+        cell_centroids[c].z /= static_cast<double>(cell_face_counts[c]);
+
+        checked++;
+        bool cell_inside = true;
+        int worst_face = 0;
+        double worst_violation = 0.0;
+
+        for (int f : cell_faces[c]) {
+            Vec3 fc, n;
+            if (!face_centroid(data, f, fc) || !face_normal(data, f, n)) continue;
+
+            double nmag = norm(n);
+            if (nmag <= 0.0) continue;
+
+            // Existing orientation validation treats face normal as pointing toward c0.
+            // Therefore c0 is inside on the positive side, c1 on the negative side.
+            double signed_distance = dot(n, subtract(cell_centroids[c], fc)) / nmag;
+            double violation = 0.0;
+            if (data.face_c0[f] == c) {
+                violation = (signed_distance < -tolerance) ? -signed_distance : 0.0;
+            } else if (data.face_c1[f] == c) {
+                violation = (signed_distance > tolerance) ? signed_distance : 0.0;
+            }
+
+            if (violation > worst_violation) {
+                worst_violation = violation;
+                worst_face = f + 1;
+            }
+        }
+
+        if (worst_violation > 0.0) {
+            cell_inside = false;
+            outside++;
+            max_violation = std::max(max_violation, worst_violation);
+        } else {
+            inside++;
+        }
+
+        if (!cell_inside && failed_cells.size() < 20) {
+            nlohmann::json item;
+            item["cell_id"] = c;
+            item["zone_id"] = (static_cast<size_t>(c - 1) < data.cell_zones.size()) ? data.cell_zones[c - 1] : 0;
+            item["centroid"] = {cell_centroids[c].x, cell_centroids[c].y, cell_centroids[c].z};
+            item["violating_face"] = worst_face;
+            item["violation_distance"] = worst_violation;
+            failed_cells.push_back(item);
+        }
+    }
+
+    j["method"] = "face-centroid-average + oriented-face-halfspace";
+    j["tolerance"] = tolerance;
+    j["checked"] = checked;
+    j["inside"] = inside;
+    j["outside"] = outside;
+    j["skipped"] = skipped;
+    j["passed"] = (outside == 0);
+    j["max_violation_distance"] = max_violation;
+    j["failed_cells_sample"] = failed_cells;
+    return j;
+}
+
+} // namespace
 
 QueryEngine::QueryEngine(const MeshData& data) : data_(data) {}
 
@@ -64,6 +293,8 @@ nlohmann::json QueryEngine::stats() {
     j["has_hanging_nodes"] = !data_.face_trees.empty() || !data_.cell_trees.empty();
     j["has_nonconformal"] = !data_.if_parents.empty();
     j["has_periodic"] = !data_.periodic_pairs.empty();
+
+    j["centroid_check"] = build_centroid_check_stats(data_);
 
     return j;
 }
