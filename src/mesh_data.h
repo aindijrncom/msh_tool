@@ -103,6 +103,7 @@ struct ValidationIssue {
     int face_id = 0;
     int cell_id = 0;
     int zone_id = 0;
+    double value = 0.0;    // numeric context, e.g. cos_theta for RHR errors
 };
 
 struct ValidationReport {

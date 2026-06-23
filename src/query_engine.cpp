@@ -1,10 +1,18 @@
+#ifdef _MSC_VER
+#pragma execution_character_set("utf-8")
+#endif
+
 #include "query_engine.h"
 #include <algorithm>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <map>
 #include <set>
 #include <cmath>
 #include <limits>
 #include <vector>
+#include <sstream>
 
 namespace msh {
 
@@ -105,8 +113,27 @@ bool face_normal(const MeshData& data, int face_idx, Vec3& normal) {
     return norm(normal) > 0.0;
 }
 
-nlohmann::json build_centroid_check_stats(const MeshData& data) {
-    nlohmann::json j;
+struct CentroidFailedCell {
+    int cell_id;
+    int zone_id;
+    double cx, cy, cz;
+    int violating_face;
+    double violation_distance;
+    int face_count;
+};
+
+struct CentroidCheckResult {
+    int checked = 0;
+    int inside = 0;
+    int outside = 0;
+    int skipped = 0;
+    double max_violation = 0.0;
+    double tolerance = 0.0;
+    std::vector<CentroidFailedCell> failed_cells;
+};
+
+CentroidCheckResult compute_centroid_check(const MeshData& data) {
+    CentroidCheckResult result;
 
     int total_cells = static_cast<int>(data.cell_count());
     int total_faces = static_cast<int>(data.face_count());
@@ -127,7 +154,7 @@ nlohmann::json build_centroid_check_stats(const MeshData& data) {
     }
     double mesh_scale = data.node_count() > 0 ? norm(subtract(bmax, bmin)) : 1.0;
     if (mesh_scale <= 0.0) mesh_scale = 1.0;
-    double tolerance = mesh_scale * 1e-10;
+    result.tolerance = mesh_scale * 1e-10;
 
     for (int f = 0; f < total_faces; f++) {
         Vec3 fc;
@@ -156,16 +183,9 @@ nlohmann::json build_centroid_check_stats(const MeshData& data) {
         }
     }
 
-    int checked = 0;
-    int inside = 0;
-    int outside = 0;
-    int skipped = 0;
-    double max_violation = 0.0;
-    nlohmann::json failed_cells = nlohmann::json::array();
-
     for (int c = 1; c <= total_cells; c++) {
         if (cell_faces[c].empty() || cell_face_counts[c] == 0) {
-            skipped++;
+            result.skipped++;
             continue;
         }
 
@@ -173,7 +193,7 @@ nlohmann::json build_centroid_check_stats(const MeshData& data) {
         cell_centroids[c].y /= static_cast<double>(cell_face_counts[c]);
         cell_centroids[c].z /= static_cast<double>(cell_face_counts[c]);
 
-        checked++;
+        result.checked++;
         bool cell_inside = true;
         int worst_face = 0;
         double worst_violation = 0.0;
@@ -185,14 +205,12 @@ nlohmann::json build_centroid_check_stats(const MeshData& data) {
             double nmag = norm(n);
             if (nmag <= 0.0) continue;
 
-            // Existing orientation validation treats face normal as pointing toward c0.
-            // Therefore c0 is inside on the positive side, c1 on the negative side.
             double signed_distance = dot(n, subtract(cell_centroids[c], fc)) / nmag;
             double violation = 0.0;
             if (data.face_c0[f] == c) {
-                violation = (signed_distance < -tolerance) ? -signed_distance : 0.0;
+                violation = (signed_distance < -result.tolerance) ? -signed_distance : 0.0;
             } else if (data.face_c1[f] == c) {
-                violation = (signed_distance > tolerance) ? signed_distance : 0.0;
+                violation = (signed_distance > result.tolerance) ? signed_distance : 0.0;
             }
 
             if (violation > worst_violation) {
@@ -203,31 +221,50 @@ nlohmann::json build_centroid_check_stats(const MeshData& data) {
 
         if (worst_violation > 0.0) {
             cell_inside = false;
-            outside++;
-            max_violation = std::max(max_violation, worst_violation);
-        } else {
-            inside++;
-        }
+            result.outside++;
+            result.max_violation = std::max(result.max_violation, worst_violation);
 
-        if (!cell_inside && failed_cells.size() < 20) {
-            nlohmann::json item;
-            item["cell_id"] = c;
-            item["zone_id"] = (static_cast<size_t>(c - 1) < data.cell_zones.size()) ? data.cell_zones[c - 1] : 0;
-            item["centroid"] = {cell_centroids[c].x, cell_centroids[c].y, cell_centroids[c].z};
-            item["violating_face"] = worst_face;
-            item["violation_distance"] = worst_violation;
-            failed_cells.push_back(item);
+            CentroidFailedCell cell;
+            cell.cell_id = c;
+            cell.zone_id = (static_cast<size_t>(c - 1) < data.cell_zones.size()) ? data.cell_zones[c - 1] : 0;
+            cell.cx = cell_centroids[c].x;
+            cell.cy = cell_centroids[c].y;
+            cell.cz = cell_centroids[c].z;
+            cell.violating_face = worst_face;
+            cell.violation_distance = worst_violation;
+            cell.face_count = static_cast<int>(cell_faces[c].size());
+            result.failed_cells.push_back(cell);
+        } else {
+            result.inside++;
         }
     }
 
+    return result;
+}
+
+nlohmann::json build_centroid_check_stats(const MeshData& data) {
+    auto result = compute_centroid_check(data);
+    nlohmann::json j;
     j["method"] = "face-centroid-average + oriented-face-halfspace";
-    j["tolerance"] = tolerance;
-    j["checked"] = checked;
-    j["inside"] = inside;
-    j["outside"] = outside;
-    j["skipped"] = skipped;
-    j["passed"] = (outside == 0);
-    j["max_violation_distance"] = max_violation;
+    j["tolerance"] = result.tolerance;
+    j["checked"] = result.checked;
+    j["inside"] = result.inside;
+    j["outside"] = result.outside;
+    j["skipped"] = result.skipped;
+    j["passed"] = (result.outside == 0);
+    j["max_violation_distance"] = result.max_violation;
+
+    nlohmann::json failed_cells = nlohmann::json::array();
+    for (size_t i = 0; i < std::min(size_t(20), result.failed_cells.size()); ++i) {
+        const auto& c = result.failed_cells[i];
+        nlohmann::json item;
+        item["cell_id"] = c.cell_id;
+        item["zone_id"] = c.zone_id;
+        item["centroid"] = {c.cx, c.cy, c.cz};
+        item["violating_face"] = c.violating_face;
+        item["violation_distance"] = c.violation_distance;
+        failed_cells.push_back(item);
+    }
     j["failed_cells_sample"] = failed_cells;
     return j;
 }
@@ -648,6 +685,180 @@ nlohmann::json QueryEngine::validate_report(const ValidationReport& report) {
         };
     }
     return j;
+}
+
+// ============================================================
+// CSV export helpers
+// ============================================================
+
+std::string csv_escape(const std::string& s) {
+    if (s.find(',') != std::string::npos || s.find('"') != std::string::npos || s.find('\n') != std::string::npos) {
+        std::string out = "\"";
+        for (char c : s) {
+            if (c == '"') out += "\"\"";
+            else out += c;
+        }
+        out += "\"";
+        return out;
+    }
+    return s;
+}
+
+std::string bc_type_name(int bc) {
+    switch (bc) {
+        case 2:  return "interior";
+        case 3:  return "wall";
+        case 4:  return "pressure-inlet";
+        case 5:  return "pressure-outlet";
+        case 7:  return "symmetry";
+        case 8:  return "periodic-shadow";
+        case 9:  return "pressure-far-field";
+        case 10: return "velocity-inlet";
+        case 12: return "periodic";
+        case 14: return "fan/porous-jump/radiator";
+        case 20: return "mass-flow-inlet";
+        case 24: return "interface";
+        case 31: return "parent";
+        case 36: return "outflow";
+        case 37: return "axis";
+        default: return "unknown";
+    }
+}
+
+std::string centroid_recommendation() {
+    return "检查该 cell 周围面的绕向，特别是 violating_face 指向的方向";
+}
+
+std::string rhr_recommendation(int bc_type, int c1) {
+    if (bc_type == 2) {
+        return "内部面法向翻转，检查两侧 cell 的绕向一致性";
+    }
+    if (c1 == 0) {
+        return "边界面法向朝外错误，检查 face 节点顺序或 c0/c1 关系";
+    }
+    return "面法向与 cell 中心向量夹角大于90度，检查面绕向";
+}
+
+// ============================================================
+// --export-csv <prefix>
+// ============================================================
+void QueryEngine::export_csv(const std::string& prefix, const ValidationReport& report) const {
+    auto centroid_result = compute_centroid_check(data_);
+
+    // 1. summary.csv
+    {
+        std::string path = prefix + "_summary.csv";
+        std::ofstream ofs(path, std::ios::binary);
+        if (!ofs.is_open()) {
+            std::cerr << "Error: cannot write " << path << std::endl;
+            return;
+        }
+
+        // UTF-8 BOM for Excel
+        ofs.write("\xEF\xBB\xBF", 3);
+
+        int polyhedral_count = 0;
+        for (int t : data_.cell_types) {
+            if (t == 7) polyhedral_count++;
+        }
+
+        size_t error_count = 0;
+        size_t warning_count = 0;
+        for (const auto& issue : report.issues) {
+            if (issue.severity == Severity::ERROR) error_count++;
+            else if (issue.severity == Severity::WARNING) warning_count++;
+        }
+
+        ofs << "key,value\n";
+        ofs << "total_cells," << data_.cell_count() << "\n";
+        ofs << "total_faces," << data_.face_count() << "\n";
+        ofs << "total_nodes," << data_.node_count() << "\n";
+        ofs << "dimensions," << data_.dimensions << "\n";
+        ofs << "cell_type_polyhedral," << polyhedral_count << "\n";
+        ofs << "valid," << (report.valid ? "true" : "false") << "\n";
+        ofs << "centroid_checked," << centroid_result.checked << "\n";
+        ofs << "centroid_failed," << centroid_result.outside << "\n";
+        ofs << "centroid_passed," << centroid_result.inside << "\n";
+        ofs << "centroid_skipped," << centroid_result.skipped << "\n";
+        ofs << "rhr_checked," << report.faces_checked << "\n";
+        ofs << "rhr_failed," << report.faces_failed << "\n";
+        ofs << "rhr_passed," << report.faces_passed << "\n";
+        ofs << "max_violation_distance," << std::setprecision(12) << centroid_result.max_violation << "\n";
+        ofs << "error_count," << error_count << "\n";
+        ofs << "warning_count," << warning_count << "\n";
+        ofs.close();
+    }
+
+    // 2. centroid_failed.csv
+    {
+        std::string path = prefix + "_centroid_failed.csv";
+        std::ofstream ofs(path, std::ios::binary);
+        if (!ofs.is_open()) {
+            std::cerr << "Error: cannot write " << path << std::endl;
+            return;
+        }
+
+        // UTF-8 BOM for Excel
+        ofs.write("\xEF\xBB\xBF", 3);
+
+        ofs << "cell_id,zone_id,centroid_x,centroid_y,centroid_z,violating_face,violation_distance,face_count,recommendation\n";
+        for (const auto& c : centroid_result.failed_cells) {
+            ofs << c.cell_id << ","
+               << c.zone_id << ","
+               << std::setprecision(12) << c.cx << ","
+               << std::setprecision(12) << c.cy << ","
+               << std::setprecision(12) << c.cz << ","
+               << c.violating_face << ","
+               << std::setprecision(12) << c.violation_distance << ","
+               << c.face_count << ","
+               << csv_escape(centroid_recommendation()) << "\n";
+        }
+        ofs.close();
+    }
+
+    // 3. rhr_failed.csv
+    {
+        std::string path = prefix + "_rhr_failed.csv";
+        std::ofstream ofs(path, std::ios::binary);
+        if (!ofs.is_open()) {
+            std::cerr << "Error: cannot write " << path << std::endl;
+            return;
+        }
+
+        // UTF-8 BOM for Excel
+        ofs.write("\xEF\xBB\xBF", 3);
+
+        ofs << "face_id,zone_id,bc_type,bc_name,c0,c1,cos_theta,node_count,recommendation\n";
+        for (const auto& issue : report.issues) {
+            if (issue.severity != Severity::ERROR || issue.face_id <= 0) continue;
+
+            int fidx = issue.face_id - 1;
+            if (fidx < 0 || static_cast<size_t>(fidx) >= data_.face_count()) continue;
+
+            int bc = data_.face_bc_types[fidx];
+            size_t off = data_.face_node_offset[fidx];
+            size_t next = (static_cast<size_t>(fidx + 1) < data_.face_count())
+                              ? data_.face_node_offset[fidx + 1]
+                              : data_.face_nodes.size();
+            int node_count = static_cast<int>(next - off);
+
+            ofs << issue.face_id << ","
+               << issue.zone_id << ","
+               << bc << ","
+               << csv_escape(bc_type_name(bc)) << ","
+               << data_.face_c0[fidx] << ","
+               << data_.face_c1[fidx] << ","
+               << std::setprecision(12) << issue.value << ","
+               << node_count << ","
+               << csv_escape(rhr_recommendation(bc, data_.face_c1[fidx])) << "\n";
+        }
+        ofs.close();
+    }
+
+    std::cerr << "Exported CSV files:\n"
+              << "  " << prefix << "_summary.csv\n"
+              << "  " << prefix << "_centroid_failed.csv\n"
+              << "  " << prefix << "_rhr_failed.csv" << std::endl;
 }
 
 // ============================================================

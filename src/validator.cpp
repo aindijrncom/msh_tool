@@ -474,7 +474,7 @@ void Validator::validate_geometry(ValidationReport& report) {
                 "Face " + std::to_string(f + 1) + " (zone " + std::to_string(data_.face_zone_ids[f]) +
                 "): right-hand rule violation, cos(theta) = " + std::to_string(cos_theta) +
                 " (expected > 0)",
-                0, f + 1, 0, data_.face_zone_ids[f]});
+                0, f + 1, 0, data_.face_zone_ids[f], cos_theta});
             report.faces_failed++;
         } else {
             report.faces_passed++;

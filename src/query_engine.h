@@ -1,7 +1,9 @@
 #pragma once
 
 #include "mesh_data.h"
+#include "validator.h"
 #include <nlohmann/json.hpp>
+#include <string>
 
 namespace msh {
 
@@ -19,6 +21,9 @@ public:
     nlohmann::json nodes();
     nlohmann::json validate_report(const ValidationReport& report);
     nlohmann::json full_summary();
+
+    // Export diagnostic data to CSV files (no external dependencies)
+    void export_csv(const std::string& prefix, const ValidationReport& report) const;
 
 private:
     const MeshData& data_;

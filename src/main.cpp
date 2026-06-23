@@ -50,6 +50,7 @@ OPTIONS:
 
   General:
     -o, --export-vtk [prefix]  Export [prefix].vtk + .vtu (default: derived from .msh)
+    --export-csv [prefix]      Export diagnostic CSV files (default: derived from .msh)
     -S, --scale <factor>       Multiply all coordinates (default: 1000, m→mm)
     -C, --no-color             Disable ANSI color output
     -h, --help                 Print this help text
@@ -87,6 +88,7 @@ int main(int argc, char* argv[]) {
     bool use_color = true;  // color on by default
     double scale = 1000.0;  // m → mm by default
     std::string vtk_prefix;      // --export-vtk base name
+    std::string csv_prefix;      // --export-csv base name
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -110,6 +112,14 @@ int main(int argc, char* argv[]) {
                 vtk_prefix = argv[++i];
             } else {
                 vtk_prefix = "AUTO"; // auto-derive from msh path
+            }
+        }
+        else if (arg == "--export-csv") {
+            // Optional argument: if next arg doesn't start with '-', use it as prefix
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                csv_prefix = argv[++i];
+            } else {
+                csv_prefix = "AUTO"; // auto-derive from msh path
             }
         }
         else if (arg == "--scale" || arg == "-S") {
@@ -270,6 +280,25 @@ int main(int argc, char* argv[]) {
 
     // --- Query ---
     msh::QueryEngine qe(mesh);
+
+    // --- Export CSV (optional) ---
+    if (!csv_prefix.empty()) {
+        if (csv_prefix == "AUTO") {
+            std::string base = filepath;
+            if (base.size() > 4) {
+                auto ext = base.substr(base.size() - 4);
+                if (ext == ".msh" || ext == ".MSH") {
+                    base = base.substr(0, base.size() - 4);
+                }
+            }
+            csv_prefix = base;
+        }
+        if (!no_validate) {
+            qe.export_csv(csv_prefix, validation_report);
+        } else {
+            std::cerr << "Warning: --export-csv requires validation; use without -V" << std::endl;
+        }
+    }
 
     if (query_mode.empty()) {
         // Default: validation + summary
